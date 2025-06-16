@@ -576,11 +576,76 @@ class _ScheduleForwardOnly(PipelineScheduleSingle):
             _wait_batch_p2p(work)
 
 
-class ScheduleGPipe(PipelineScheduleSingle):
+class ScheduleGPipe(_PipelineScheduleRuntime):
     """
     The GPipe schedule.
     Will go through all the microbatches in a fill-drain manner.
     """
+
+    def __init__(
+        self,
+        stages: Union[_PipelineStageBase, list[_PipelineStageBase]],
+        n_microbatches: int,
+        loss_fn: Optional[Callable] = None,
+        args_chunk_spec: Optional[tuple[TensorChunkSpec, ...]] = None,
+        kwargs_chunk_spec: Optional[dict[str, TensorChunkSpec]] = None,
+        output_merge_spec: Optional[Union[dict[str, Any], tuple[Any]]] = None,
+        scale_grads: bool = True,
+    ):
+        # Handle both single stage and multi-stage inputs for backward compatibility
+        if isinstance(stages, list):
+            stages_list = stages
+        else:
+            stages_list = [stages]
+        
+        super().__init__(
+            stages=stages_list,
+            n_microbatches=n_microbatches,
+            loss_fn=loss_fn,
+            args_chunk_spec=args_chunk_spec,
+            kwargs_chunk_spec=kwargs_chunk_spec,
+            output_merge_spec=output_merge_spec,
+            scale_grads=scale_grads,
+        )
+        
+        # Generate GPipe pipeline order
+        self._generate_gpipe_pipeline_order()
+        
+        # Load the actions into the runtime
+        self._load_actions(self.pipeline_order)
+
+    def _generate_gpipe_pipeline_order(self):
+        """Generate the GPipe pipeline schedule IR."""
+        self.pipeline_order: dict[int, list[Optional[_Action]]] = {}
+        
+        # Initialize pipeline order for all ranks
+        for rank in range(self.pp_group_size):
+            self.pipeline_order[rank] = []
+        
+        # Get the local stages for each rank
+        rank_to_stages = {}
+        for rank in range(self.pp_group_size):
+            rank_to_stages[rank] = []
+            for stage_idx in range(self._num_stages):
+                if self.stage_index_to_group_rank[stage_idx] == rank:
+                    rank_to_stages[rank].append(stage_idx)
+        
+        # Forward pass: Fill phase
+        for mb_idx in range(self._n_microbatches):
+            for rank in range(self.pp_group_size):
+                for stage_idx in rank_to_stages[rank]:
+                    self.pipeline_order[rank].append(
+                        _Action(stage_idx, FORWARD, mb_idx)
+                    )
+        
+        # Backward pass: Drain phase (only if has_backward)
+        if self._has_backward:
+            for mb_idx in range(self._n_microbatches):
+                for rank in reversed(range(self.pp_group_size)):
+                    for stage_idx in reversed(rank_to_stages[rank]):
+                        self.pipeline_order[rank].append(
+                            _Action(stage_idx, FULL_BACKWARD, mb_idx)
+                        )
 
     def _step_microbatches(
         self,
@@ -596,82 +661,134 @@ class ScheduleGPipe(PipelineScheduleSingle):
         Args:
             microbatches: list of microbatch args.
         """
-        arg_mbs, kwarg_mbs = self._check_inputs(arg_mbs, kwarg_mbs, target_mbs, losses)
-
-        if not self._stage_initialized:
-            self._initialize_stage(arg_mbs[0], kwarg_mbs[0])
-
-        # Delay send waits
-        fwd_sends_to_wait: list[list[dist.Work]] = []
-
-        # Run microbatches
-        for i in range(self._n_microbatches):
-            with record_function(f"Forward {i}"):
-                ops = self._stage.get_fwd_recv_ops(i)
-                works = _sorted_batch_p2p(ops, desc="fwd_recv")
-                for work in works.values():
-                    _wait_batch_p2p(work)
-
-                output = self._stage.forward_one_chunk(i, arg_mbs[i], kwarg_mbs[i])  # type: ignore[index]
-
-                ops = self._stage.get_fwd_send_ops(i)
-                works = _sorted_batch_p2p(ops, desc="fwd_send")
-                fwd_sends_to_wait.extend(works.values())
-
-            logger.debug("[%s] Forwarded microbatch %s", self._stage.stage_index, i)
-
-            self._maybe_compute_loss(self._stage, output, target_mbs, i)
-
-        # Wait for all forward sends to finish
-        # This should not have performance impact because by the time the first
-        # backward arrives all the forward sends should have been finished.
-        for work in fwd_sends_to_wait:
-            _wait_batch_p2p(work)
-
-        # No loss function, no need to run backward
-        if not self._has_backward:
-            return
-
-        # Run backward
-        # Delay send waits
-        bwd_sends_to_wait: list[list[dist.Work]] = []
-        for i in range(self._n_microbatches):
-            with record_function(f"Backward {i}"):
-                ops = self._stage.get_bwd_recv_ops(i)
-                works = _sorted_batch_p2p(ops, desc="bwd_recv")
-                for work in works.values():
-                    _wait_batch_p2p(work)
-
-                loss = self._maybe_get_loss(self._stage, i)
-                self._stage.backward_one_chunk(
-                    i,
-                    loss=loss,
-                    last_backward=i == self._n_microbatches - 1,
-                )
-
-                ops = self._stage.get_bwd_send_ops(i)
-                works = _sorted_batch_p2p(ops, desc="bwd_send")
-                bwd_sends_to_wait.extend(works.values())
-
-            logger.debug("[%s] Backwarded microbatch %s", self._stage.stage_index, i)
-
-        self._stage.scale_grads(
-            grad_scale_factor=self._n_microbatches if self.scale_grads else 1
-        )
-
-        # Return losses if there is a container passed in
-        self._update_losses(self._stage, losses)
-
-        # Wait for all backward sends to finish
-        for work in bwd_sends_to_wait:
-            _wait_batch_p2p(work)
+        # Delegate to _PipelineScheduleRuntime._step_microbatches()
+        return super()._step_microbatches(arg_mbs, kwarg_mbs, target_mbs, losses)
 
 
-class Schedule1F1B(PipelineScheduleSingle):
+class Schedule1F1B(_PipelineScheduleRuntime):
     """
     The 1F1B schedule.
     Will perform one forward and one backward on the microbatches in steady state.
     """
+
+    def __init__(
+        self,
+        stages: Union[_PipelineStageBase, list[_PipelineStageBase]],
+        n_microbatches: int,
+        loss_fn: Optional[Callable] = None,
+        args_chunk_spec: Optional[tuple[TensorChunkSpec, ...]] = None,
+        kwargs_chunk_spec: Optional[dict[str, TensorChunkSpec]] = None,
+        output_merge_spec: Optional[Union[dict[str, Any], tuple[Any]]] = None,
+        scale_grads: bool = True,
+    ):
+        # Handle both single stage and multi-stage inputs for backward compatibility
+        if isinstance(stages, list):
+            stages_list = stages
+        else:
+            stages_list = [stages]
+        
+        super().__init__(
+            stages=stages_list,
+            n_microbatches=n_microbatches,
+            loss_fn=loss_fn,
+            args_chunk_spec=args_chunk_spec,
+            kwargs_chunk_spec=kwargs_chunk_spec,
+            output_merge_spec=output_merge_spec,
+            scale_grads=scale_grads,
+        )
+        
+        # Generate 1F1B pipeline order
+        self._generate_1f1b_pipeline_order()
+        
+        # Load the actions into the runtime
+        self._load_actions(self.pipeline_order)
+
+    def _generate_1f1b_pipeline_order(self):
+        """Generate the 1F1B pipeline schedule IR."""
+        self.pipeline_order: dict[int, list[Optional[_Action]]] = {}
+        
+        # Initialize pipeline order for all ranks
+        for rank in range(self.pp_group_size):
+            self.pipeline_order[rank] = []
+        
+        # Get the local stages for each rank
+        rank_to_stages = {}
+        for rank in range(self.pp_group_size):
+            rank_to_stages[rank] = []
+            for stage_idx in range(self._num_stages):
+                if self.stage_index_to_group_rank[stage_idx] == rank:
+                    rank_to_stages[rank].append(stage_idx)
+        
+        # Calculate warmup phases for each rank
+        warmup_per_rank = {}
+        for rank in range(self.pp_group_size):
+            if rank_to_stages[rank]:
+                # Last stage has 1 warmup, second-to-last 2 warmups, etc.
+                min_stage_idx = min(rank_to_stages[rank])
+                warmup_per_rank[rank] = min(
+                    self._n_microbatches,
+                    self._num_stages - min_stage_idx,
+                )
+            else:
+                warmup_per_rank[rank] = 0
+        
+        # Warmup phase - forward passes only
+        for mb_idx in range(self._n_microbatches):
+            for rank in range(self.pp_group_size):
+                if mb_idx < warmup_per_rank[rank]:
+                    for stage_idx in rank_to_stages[rank]:
+                        self.pipeline_order[rank].append(
+                            _Action(stage_idx, FORWARD, mb_idx)
+                        )
+        
+        # 1F1B steady state and cooldown phases
+        if self._has_backward:
+            # Track when each rank should start doing backwards
+            total_time_steps = 0
+            
+            # Find maximum time steps needed
+            max_time_steps = 0
+            for rank in range(self.pp_group_size):
+                warmup_time = warmup_per_rank[rank]
+                steady_time = max(0, 2 * (self._n_microbatches - warmup_time))
+                cooldown_time = 2 * warmup_time
+                max_time_steps = max(max_time_steps, warmup_time + steady_time + cooldown_time)
+            
+            # Now build the schedule timestep by timestep
+            for timestep in range(max_time_steps):
+                for rank in range(self.pp_group_size):
+                    warmup_time = warmup_per_rank[rank]
+                    
+                    if timestep < warmup_time:
+                        # Warmup phase: already handled above
+                        continue
+                    elif timestep < warmup_time + 2 * (self._n_microbatches - warmup_time):
+                        # Steady state phase: alternate between backward and forward
+                        steady_step = timestep - warmup_time
+                        if steady_step % 2 == 0:
+                            # Even steps: backward
+                            bwd_mb_idx = steady_step // 2
+                            for stage_idx in reversed(rank_to_stages[rank]):
+                                self.pipeline_order[rank].append(
+                                    _Action(stage_idx, FULL_BACKWARD, bwd_mb_idx)
+                                )
+                        else:
+                            # Odd steps: forward
+                            fwd_mb_idx = warmup_time + (steady_step + 1) // 2
+                            if fwd_mb_idx < self._n_microbatches:
+                                for stage_idx in rank_to_stages[rank]:
+                                    self.pipeline_order[rank].append(
+                                        _Action(stage_idx, FORWARD, fwd_mb_idx)
+                                    )
+                    else:
+                        # Cooldown phase: remaining backwards
+                        cooldown_step = timestep - warmup_time - 2 * (self._n_microbatches - warmup_time)
+                        if cooldown_step % 2 == 0 and cooldown_step // 2 < warmup_time:
+                            bwd_mb_idx = self._n_microbatches - warmup_time + cooldown_step // 2
+                            for stage_idx in reversed(rank_to_stages[rank]):
+                                self.pipeline_order[rank].append(
+                                    _Action(stage_idx, FULL_BACKWARD, bwd_mb_idx)
+                                )
 
     def _step_microbatches(
         self,
@@ -687,131 +804,8 @@ class Schedule1F1B(PipelineScheduleSingle):
         Args:
             microbatches: list of microbatch args.
         """
-        arg_mbs, kwarg_mbs = self._check_inputs(arg_mbs, kwarg_mbs, target_mbs, losses)
-
-        if not self._stage_initialized:
-            self._initialize_stage(arg_mbs[0], kwarg_mbs[0])
-
-        # Last stage has 1 warmup, second-to-last 2 warmups, ...
-        # first stage `num_stages` warmups
-        warmup_chunks = min(
-            self._n_microbatches,
-            self._num_stages - self._stage.stage_index,
-        )
-
-        # Chunk counters
-        fwd_mb_index = 0
-        bwd_mb_index = 0
-
-        # Warmup phase
-        send_work: list[dist.Work] = []
-        fwd_sends = []
-        for _ in range(warmup_chunks):
-            # Receive activations
-            fwd_recvs = self._stage.get_fwd_recv_ops(fwd_mb_index)
-            _wait_batch_p2p(_batch_p2p(fwd_recvs, desc="fwd_recv"))
-
-            # Compute
-            output = self._stage.forward_one_chunk(
-                fwd_mb_index, arg_mbs[fwd_mb_index], kwarg_mbs[fwd_mb_index]
-            )  # type: ignore[index]
-
-            # Clear previous chunk's forward sends (hopefully they have well
-            # finished, otherwise, we are heavily communication bound, in which
-            # case it doesn't create a lot of benefit to compute next chunk
-            # eagerly either)
-            _wait_batch_p2p(send_work)
-
-            # Send activations
-            fwd_sends = self._stage.get_fwd_send_ops(fwd_mb_index)
-            if fwd_mb_index != warmup_chunks - 1:
-                # Safe to fire
-                send_work = _batch_p2p(fwd_sends, desc="fwd_send")
-            # otherwise:
-            #   The last foward send is left for fuse with first 1B in 1B1F below
-
-            # Compute loss
-            self._maybe_compute_loss(self._stage, output, target_mbs, fwd_mb_index)
-            fwd_mb_index += 1
-
-        # Now we should have send ops left over, to be fused with first 1B of 1B1F phase below.
-
-        # 1B1F phase
-        while True:  # Don't worry, we have a break inside
-            # We actually do 1B first as the `1B1F` name indicates, so prepare its recv ops
-            bwd_recvs = self._stage.get_bwd_recv_ops(bwd_mb_index)
-
-            # Now, we need to fire the fwd_sends and bwd_recvs together
-            _wait_batch_p2p(_batch_p2p(fwd_sends + bwd_recvs, desc="fwd_send_bwd_recv"))
-
-            # Backward one chunk
-            loss = self._maybe_get_loss(self._stage, bwd_mb_index)
-            self._stage.backward_one_chunk(
-                bwd_mb_index,
-                loss=loss,
-                last_backward=bwd_mb_index == self._n_microbatches - 1,
-            )
-
-            # Get the bwd send ops, but don't fire, to be fused with the 1F below
-            bwd_sends = self._stage.get_bwd_send_ops(bwd_mb_index)
-            bwd_mb_index += 1
-
-            if fwd_mb_index == self._n_microbatches:
-                # We are done with 1B1F, so break with some left-over bwd_sends
-                break
-
-            # We prepare 1F of the `1B1F`
-            fwd_recvs = self._stage.get_fwd_recv_ops(fwd_mb_index)
-
-            # Fuse it with bwd_sends above
-            _wait_batch_p2p(_batch_p2p(bwd_sends + fwd_recvs, desc="bwd_send_fwd_recv"))
-
-            # Now do the fwd
-            output = self._stage.forward_one_chunk(
-                fwd_mb_index, arg_mbs[fwd_mb_index], kwarg_mbs[fwd_mb_index]
-            )  # type: ignore[index]
-
-            # Compute loss
-            self._maybe_compute_loss(self._stage, output, target_mbs, fwd_mb_index)
-
-            # Get the fwd send ops, but don't fire, leave it for the next iter (wrap-around)
-            fwd_sends = self._stage.get_fwd_send_ops(fwd_mb_index)
-            fwd_mb_index += 1
-
-        # Remember we still have some bwd_sends left over after the break? Now it is time to fire it
-        send_work = _batch_p2p(bwd_sends, desc="bwd_send")
-
-        # Cooldown
-        while bwd_mb_index < self._n_microbatches:
-            # prepare bwd recv ops
-            bwd_recvs = self._stage.get_bwd_recv_ops(bwd_mb_index)
-            _wait_batch_p2p(_batch_p2p(bwd_recvs, desc="bwd_recv"))
-
-            # Backward one chunk
-            loss = self._maybe_get_loss(self._stage, bwd_mb_index)
-            self._stage.backward_one_chunk(
-                bwd_mb_index,
-                loss=loss,
-                last_backward=bwd_mb_index == self._n_microbatches - 1,
-            )
-
-            # Clear previous chunk's backward sends (hopefully they have well finished)
-            _wait_batch_p2p(send_work)
-
-            # Get the bwd send ops, fire it
-            bwd_sends = self._stage.get_bwd_send_ops(bwd_mb_index)
-            send_work = _batch_p2p(bwd_sends, desc="bwd_send")
-            bwd_mb_index += 1
-
-        self._stage.scale_grads(
-            grad_scale_factor=self._n_microbatches if self.scale_grads else 1
-        )
-
-        # Wait for the last backward send to finish
-        _wait_batch_p2p(send_work)
-
-        # Return losses if there is a container passed in
-        self._update_losses(self._stage, losses)
+        # Delegate to _PipelineScheduleRuntime._step_microbatches()
+        return super()._step_microbatches(arg_mbs, kwarg_mbs, target_mbs, losses)
 
 
 def _add_unshard_reshard(
