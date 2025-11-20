@@ -1591,23 +1591,12 @@ endif()
 # End ATen checks
 #
 
-# Install `fmtlib` header.
-# This was the default behavior before version 12.0.0.
-# Since PyTorch C API depends on it, make it available for projects that
-# depend on PyTorch.
 if(NOT USE_SYSTEM_FMT)
   set(FMT_INSTALL ON)
   set(TEMP_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libs" FORCE)
   add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/fmt)
 
-  # Disable compiler feature checks for `fmt`.
-  #
-  # CMake compiles a little program to check compiler features. Some of our build
-  # configurations (notably the mobile build analyzer) will populate
-  # CMAKE_CXX_FLAGS in ways that break feature checks. Since we already know
-  # `fmt` is compatible with a superset of the compilers that PyTorch is, it
-  # shouldn't be too bad to just disable the checks.
   set_target_properties(fmt-header-only PROPERTIES INTERFACE_COMPILE_FEATURES "")
 
   list(APPEND Caffe2_DEPENDENCY_LIBS fmt::fmt-header-only)
@@ -1617,7 +1606,19 @@ else()
   if(NOT fmt_FOUND)
     message(FATAL_ERROR "Cannot find system fmt library. Please install libfmt-dev or set USE_SYSTEM_FMT=OFF")
   endif()
+
+  set(FMT_INSTALL ON)
+  set(TEMP_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libs" FORCE)
+
+  add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/fmt)
+  set_target_properties(fmt-header-only PROPERTIES INTERFACE_COMPILE_FEATURES "")
+
+  set(BUILD_SHARED_LIBS ${TEMP_BUILD_SHARED_LIBS} CACHE BOOL "Build shared libs" FORCE)
+
   list(APPEND Caffe2_DEPENDENCY_LIBS fmt::fmt)
+
+  message(STATUS "Using system fmt library for PyTorch, but installing bundled headers for extensions")
 endif()
 
 # ---[ Kineto
